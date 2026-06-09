@@ -51,13 +51,21 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# Catálogo de fuentes de noticias bolivianas (gratuitas)
+try:
+    from news_sources_bolivia import BOLIVIA_RSS_PORTALS
+except Exception:  # noqa: BLE001
+    BOLIVIA_RSS_PORTALS = []
+
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).parent
 DB_PATH = BASE_DIR / 'data' / 'osint_emi.db'
 
-# Antigüedad máxima: 1.5 años (18 meses)
-MAX_AGE_DAYS = 548  # ~18 meses
+# Antigüedad máxima de noticias. La EMI tiene baja frecuencia mediática, por lo
+# que se usa una ventana amplia (5 años) para captar su huella en los medios
+# bolivianos sin perder cobertura histórica relevante para el Vicerrectorado.
+MAX_AGE_DAYS = 1825  # ~5 años
 
 
 class OSINTMultifuente:
@@ -343,7 +351,92 @@ class OSINTMultifuente:
         
         logger.info(f"📰 NEWSINT completado: {stats['noticias_nuevas']} noticias nuevas de {stats['noticias_encontradas']} encontradas")
         return stats
-    
+
+    def recolectar_noticias_portales_bolivia(self, max_per_portal: int = 40) -> Dict[str, Any]:
+        """
+        Escanea los feeds RSS de portales nacionales bolivianos (gratuitos,
+        sin API key) y guarda solo las noticias relevantes a la EMI Bolivia.
+
+        Complementa a Google News con cobertura directa de medios bolivianos
+        (Los Tiempos, El Deber, Opinión, ANF, etc.). Reutiliza el filtro
+        estricto EMI-Bolivia para no confundir con instituciones de otros países.
+        """
+        logger.info("📰 NEWSINT-BO: Escaneando portales bolivianos...")
+        stats = {'portales': 0, 'items_revisados': 0, 'noticias_nuevas': 0, 'errores': 0}
+
+        if not BOLIVIA_RSS_PORTALS:
+            return stats
+
+        conn = sqlite3.connect(str(DB_PATH))
+        cursor = conn.cursor()
+
+        for portal in BOLIVIA_RSS_PORTALS:
+            stats['portales'] += 1
+            try:
+                import feedparser
+                resp = self.session.get(portal['rss'], timeout=15)
+                if resp.status_code != 200:
+                    stats['errores'] += 1
+                    continue
+
+                # feedparser tolera RSS 2.0, Atom y feeds mal formados
+                feed = feedparser.parse(resp.content)
+                entries = feed.entries[:max_per_portal]
+
+                for entry in entries:
+                    title = entry.get('title', '') or ''
+                    link = entry.get('link', '') or ''
+                    description = entry.get('summary', '') or entry.get('description', '') or ''
+                    pub_date = entry.get('published', '') or entry.get('updated', '') or ''
+
+                    if not title or not link:
+                        continue
+                    description = re.sub(r'<[^>]+>', '', description).strip()
+                    stats['items_revisados'] += 1
+
+                    # FILTRO estricto: solo EMI Bolivia
+                    if not self._es_relevante_emi(title, description):
+                        continue
+                    if not self._es_fecha_valida(pub_date):
+                        continue
+
+                    cursor.execute('SELECT 1 FROM osint_noticias WHERE url = ?', (link,))
+                    if cursor.fetchone():
+                        continue
+
+                    temas = self._clasificar_temas(f"{title} {description}")
+                    relevancia = self._calcular_relevancia(title, description)
+
+                    cursor.execute('''
+                        INSERT OR IGNORE INTO osint_noticias
+                        (titulo, resumen, fuente, url, fecha_publicacion,
+                         termino_busqueda, relevancia_score, temas_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        title[:500], description[:2000], portal['nombre'][:200],
+                        link[:500], pub_date, f"portal:{portal['sitio']}"[:200],
+                        relevancia, json.dumps(temas, ensure_ascii=False)
+                    ))
+                    stats['noticias_nuevas'] += 1
+
+            except Exception as e:
+                logger.warning(f"NEWSINT-BO error en {portal['nombre']}: {e}")
+                stats['errores'] += 1
+
+        conn.commit()
+        cursor.execute('''
+            INSERT OR REPLACE INTO osint_fuente_resumen
+            (tipo_tecnica, nombre_fuente, descripcion, url_base, total_datos_recolectados, ultima_recoleccion)
+            VALUES ('NEWSINT', 'Portales Bolivia (RSS)',
+                    'Monitoreo directo de diarios nacionales bolivianos',
+                    'rss', ?, datetime('now'))
+        ''', (stats['noticias_nuevas'],))
+        conn.commit()
+        conn.close()
+
+        logger.info(f"📰 NEWSINT-BO: {stats['noticias_nuevas']} nuevas de {stats['items_revisados']} items en {stats['portales']} portales")
+        return stats
+
     # ============================================================
     # TÉCNICA 2: TRENDINT - Trends Intelligence
     # ============================================================
@@ -1061,14 +1154,20 @@ class OSINTMultifuente:
             'resultados': {}
         }
         
-        # 1. NEWSINT
+        # 1. NEWSINT (Google News + portales bolivianos)
         try:
             resultados['resultados']['newsint'] = self.recolectar_noticias()
             resultados['tecnicas_ejecutadas'] += 1
         except Exception as e:
             logger.error(f"Error en NEWSINT: {e}")
             resultados['resultados']['newsint'] = {'error': str(e)}
-        
+
+        try:
+            resultados['resultados']['newsint_bolivia'] = self.recolectar_noticias_portales_bolivia()
+        except Exception as e:
+            logger.error(f"Error en NEWSINT-BO: {e}")
+            resultados['resultados']['newsint_bolivia'] = {'error': str(e)}
+
         # 2. SEINT
         try:
             resultados['resultados']['seint'] = self.recolectar_busquedas()

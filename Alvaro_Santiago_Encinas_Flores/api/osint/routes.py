@@ -19,6 +19,69 @@ from api.common.state import _osint_set_status, OSINT_EXECUTION_STATUS, OSINT_ST
 
 bp = Blueprint('osint', __name__)
 
+# Estado del job de análisis IA de noticias
+_news_ai_job = {'running': False}
+
+
+@bp.route('/api/osint/fuentes-bolivia')
+def osint_fuentes_bolivia():
+    """Catálogo de fuentes de noticias gratuitas de Bolivia + estadísticas reales."""
+    try:
+        from news_sources_bolivia import listar_fuentes
+        fuentes = listar_fuentes()
+    except Exception:
+        fuentes = []
+
+    conn = get_db()
+    cursor = conn.cursor()
+    # Conteo real de noticias por fuente
+    por_fuente = {}
+    try:
+        cursor.execute("SELECT fuente, COUNT(*) c FROM osint_noticias GROUP BY fuente")
+        por_fuente = {(r['fuente'] or 'Desconocida'): r['c'] for r in cursor.fetchall()}
+    except Exception:
+        pass
+    # Cuántas noticias ya clasificó la IA
+    analizadas = 0
+    total = 0
+    try:
+        cursor.execute("SELECT COUNT(*) c FROM osint_noticias")
+        total = cursor.fetchone()['c']
+        cursor.execute("SELECT COUNT(*) c FROM osint_noticias WHERE procesado = 1")
+        analizadas = cursor.fetchone()['c']
+    except Exception:
+        pass
+    conn.close()
+
+    return jsonify({
+        'fuentes': fuentes,
+        'totalFuentes': len(fuentes),
+        'noticiasPorFuente': por_fuente,
+        'totalNoticias': total,
+        'noticiasAnalizadasIA': analizadas,
+    })
+
+
+@bp.route('/api/osint/noticias/analizar', methods=['POST'])
+def osint_analizar_noticias():
+    """Dispara la clasificación IA (DeepSeek) de las noticias pendientes."""
+    if _news_ai_job['running']:
+        return jsonify({'status': 'en_progreso'}), 409
+
+    def run_job():
+        _news_ai_job['running'] = True
+        try:
+            from deepseek_analyzer import analizar_noticias
+            analizar_noticias()
+        except Exception as e:
+            logging.getLogger('OSINT.API').warning(f"Error IA noticias: {e}")
+        finally:
+            _news_ai_job['running'] = False
+
+    threading.Thread(target=run_job, daemon=True).start()
+    return jsonify({'status': 'iniciado', 'mensaje': 'Clasificación IA de noticias iniciada.'})
+
+
 # ============== OSINT MULTIFUENTE Y PATRONES ==============
 
 @bp.route('/api/osint/ejecutar', methods=['POST'])

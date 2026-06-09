@@ -291,7 +291,10 @@ def _collect_with_apify(source_id, platform, url, source_name, log_id=None):
             _save_collected_data(source_id, posts, platform, log_id)
         else:
             print(f"[INFO] No se obtuvieron datos de {source_name}.")
-            
+
+            # Abrir conexión propia para este camino (antes usaba cursor sin definir)
+            conn = get_db()
+            cursor = conn.cursor()
             if log_id:
                 cursor.execute('''
                     UPDATE log_ejecucion 

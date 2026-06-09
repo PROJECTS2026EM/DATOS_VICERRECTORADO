@@ -258,12 +258,15 @@ def _load_pending(conn: sqlite3.Connection, force: bool, limit) -> list:
         "AND c.id_comentario NOT IN "
         "(SELECT id_contenido FROM analisis_deepseek WHERE tipo_contenido='comentario')"
     )
+    # LEFT JOIN: DeepSeek analiza TODOS los comentarios no vacíos, incluso los de
+    # solo emojis (🥰❤️👏🔥), que BERT descarta por longitud. DeepSeek interpreta
+    # bien los emojis, así esas reacciones (normalmente positivas) sí se clasifican.
     cur.execute(f'''
         SELECT c.id_comentario AS id, c.contenido AS texto,
-               ac.sentimiento AS sent
+               COALESCE(ac.sentimiento, 'Neutral') AS sent
         FROM comentario c
-        JOIN analisis_comentario ac ON c.id_comentario = ac.id_comentario
-        WHERE c.contenido IS NOT NULL AND LENGTH(c.contenido) > 3
+        LEFT JOIN analisis_comentario ac ON c.id_comentario = ac.id_comentario
+        WHERE c.contenido IS NOT NULL AND LENGTH(TRIM(c.contenido)) >= 1
         {where_com}
     ''')
     for r in cur.fetchall():
@@ -471,6 +474,95 @@ def _generar_insights(conn, cfg) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════════
+#   Análisis de NOTICIAS (NEWSINT) con DeepSeek
+# ═══════════════════════════════════════════════════════════════
+def analizar_noticias(force: bool = False, limit=None) -> dict:
+    """Clasifica con IA las noticias de osint_noticias (medios bolivianos).
+
+    Por cada noticia obtiene: sentimiento, tema, si es realmente sobre la EMI
+    de Bolivia, tono mediático e impacto reputacional. Actualiza la fila.
+    """
+    cfg = _load_config()
+    stats = {'analizadas': 0, 'error': None}
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        cur = conn.cursor()
+        # ¿Existe la tabla de noticias?
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='osint_noticias'")
+        if not cur.fetchone():
+            return stats
+
+        where = "" if force else "WHERE (procesado IS NULL OR procesado = 0)"
+        cur.execute(f"SELECT id, titulo, resumen FROM osint_noticias {where} ORDER BY id DESC")
+        rows = cur.fetchall()
+        if limit:
+            rows = rows[:int(limit)]
+        if not rows:
+            return stats
+
+        bs = max(1, cfg['batch_size'])
+        catalogo = careers_catalog_text()
+        for i in range(0, len(rows), bs):
+            batch = rows[i:i + bs]
+            items_txt = json.dumps(
+                [{'id': r['id'], 'titular': (r['titulo'] or '')[:200],
+                  'resumen': (r['resumen'] or '')[:400]} for r in batch],
+                ensure_ascii=False)
+            prompt = (
+                "Analiza noticias de medios bolivianos sobre la Escuela Militar de "
+                "Ingeniería (EMI) de Bolivia. Para CADA ítem devuelve un objeto JSON "
+                "en la clave \"resultados\" (arreglo, mismo orden) con:\n"
+                "  - id\n"
+                "  - es_emi_bolivia: true solo si trata de la EMI de BOLIVIA (no de otro país)\n"
+                "  - sentimiento: 'Positivo' | 'Neutral' | 'Negativo'\n"
+                "  - tema_principal: 1-3 palabras\n"
+                "  - impacto_reputacional: 'alto' | 'medio' | 'bajo'\n"
+                "  - carreras: ids del catálogo mencionados, [] si ninguno\n"
+                "  - resumen: una frase\n\n"
+                f"Catálogo de carreras:\n{catalogo}\n\nNoticias:\n{items_txt}"
+            )
+            try:
+                data = _call_deepseek(cfg, [
+                    {'role': 'system', 'content': _SYSTEM_PROMPT},
+                    {'role': 'user', 'content': prompt},
+                ])
+            except DeepSeekUnavailable as e:
+                stats['error'] = str(e)
+                break
+
+            resultados = data.get('resultados') if isinstance(data, dict) else data
+            if not isinstance(resultados, list):
+                continue
+            by_id = {str(r.get('id')): r for r in resultados if isinstance(r, dict)}
+            for r in batch:
+                res = by_id.get(str(r['id']))
+                if not res:
+                    continue
+                sent = res.get('sentimiento')
+                sent = sent if sent in _SENT_VALID else 'Neutral'
+                meta = {
+                    'tema_principal': (res.get('tema_principal') or 'general')[:80],
+                    'impacto_reputacional': res.get('impacto_reputacional', 'bajo'),
+                    'es_emi_bolivia': _to_bool(res.get('es_emi_bolivia')),
+                    'carreras': _clean_careers(res.get('carreras')),
+                    'resumen_ia': (res.get('resumen') or '')[:300],
+                }
+                conn.execute('''
+                    UPDATE osint_noticias
+                    SET sentimiento = ?, temas_json = ?, procesado = 1
+                    WHERE id = ?
+                ''', (sent, json.dumps(meta, ensure_ascii=False), r['id']))
+                stats['analizadas'] += 1
+            conn.commit()
+
+        logger.info(f"📰🤖 DeepSeek noticias: {stats['analizadas']} clasificadas")
+        return stats
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════
 #   Orquestador principal
 # ═══════════════════════════════════════════════════════════════
 def analizar_con_deepseek(force: bool = False, limit=None) -> dict:
@@ -491,6 +583,11 @@ def analizar_con_deepseek(force: bool = False, limit=None) -> dict:
         if not pendientes:
             # Aún así (re)generamos insights si hay datos previos
             stats['insights'] = _generar_insights(conn, cfg)
+            conn.close()
+            try:
+                stats['noticias'] = analizar_noticias(force=force)
+            except Exception as e:
+                stats['noticias'] = {'error': str(e)}
             return stats
 
         bs = max(1, cfg['batch_size'])
@@ -535,9 +632,16 @@ def analizar_con_deepseek(force: bool = False, limit=None) -> dict:
 
         logger.info(f"✅ DeepSeek: {stats['analizados']} analizados, "
                     f"{stats['alertas']} alertas, insights={stats['insights']}")
-        return stats
     finally:
         conn.close()
+
+    # Clasificar también las noticias pendientes (NEWSINT)
+    try:
+        stats['noticias'] = analizar_noticias()
+    except Exception as e:
+        logger.warning(f"No se pudieron analizar noticias con IA: {e}")
+        stats['noticias'] = {'error': str(e)}
+    return stats
 
 
 # ═══════════════════════════════════════════════════════════════

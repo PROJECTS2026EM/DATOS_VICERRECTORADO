@@ -13,6 +13,7 @@ import logging
 from flask import Blueprint, jsonify, request
 
 from api.common.database import get_db
+from emi_careers import EMI_CAREERS
 
 logger = logging.getLogger("OSINT.API.DeepSeek")
 
@@ -98,6 +99,71 @@ def deepseek_status():
         'pendientes': max(0, total - analizados),
         'ejecutando': _job_state['running'],
         'ultimoResultado': _job_state['last_result'],
+    })
+
+
+@bp.route('/api/ai/deepseek/analytics')
+def deepseek_analytics():
+    """Métricas agregadas de la clasificación IA (DeepSeek) para el dashboard NLP.
+
+    Distingue contenido institucional vs personal y, sobre el institucional,
+    entrega distribución de sentimiento, severidad, temas y carreras.
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    if not _table_exists(cursor, 'analisis_deepseek'):
+        conn.close()
+        return jsonify({'disponible': False})
+
+    cursor.execute("SELECT COUNT(*) c FROM analisis_deepseek")
+    total = cursor.fetchone()['c']
+    cursor.execute("SELECT es_institucional, COUNT(*) c FROM analisis_deepseek GROUP BY es_institucional")
+    inst_map = {row['es_institucional']: row['c'] for row in cursor.fetchall()}
+    institucional = inst_map.get(1, 0)
+    personal = inst_map.get(0, 0)
+
+    # Distribuciones SOLO sobre contenido institucional
+    cursor.execute("SELECT sentimiento, COUNT(*) c FROM analisis_deepseek WHERE es_institucional=1 GROUP BY sentimiento")
+    sentimiento = {row['sentimiento']: row['c'] for row in cursor.fetchall()}
+
+    cursor.execute("SELECT severidad, COUNT(*) c FROM analisis_deepseek WHERE es_institucional=1 GROUP BY severidad")
+    severidad = {row['severidad']: row['c'] for row in cursor.fetchall()}
+
+    cursor.execute("SELECT COUNT(*) c FROM analisis_deepseek WHERE es_institucional=1 AND es_queja=1")
+    quejas = cursor.fetchone()['c']
+
+    cursor.execute('''SELECT tema_principal, COUNT(*) c FROM analisis_deepseek
+                      WHERE es_institucional=1 AND tema_principal IS NOT NULL
+                      GROUP BY tema_principal ORDER BY c DESC LIMIT 10''')
+    temas = [{'tema': r['tema_principal'], 'menciones': r['c']} for r in cursor.fetchall()]
+
+    # Carreras (desde carreras_json, solo institucional)
+    career_counts = {}
+    cursor.execute("SELECT carreras_json FROM analisis_deepseek WHERE es_institucional=1 AND carreras_json IS NOT NULL")
+    for r in cursor.fetchall():
+        try:
+            for cid in json.loads(r['carreras_json']):
+                career_counts[cid] = career_counts.get(cid, 0) + 1
+        except (json.JSONDecodeError, TypeError):
+            pass
+    carreras = sorted(
+        ({'careerId': cid, 'careerName': EMI_CAREERS.get(cid, cid), 'menciones': n}
+         for cid, n in career_counts.items()),
+        key=lambda x: x['menciones'], reverse=True)[:10]
+
+    conn.close()
+    pct = round(institucional / total * 100, 1) if total else 0
+    return jsonify({
+        'disponible': total > 0,
+        'total': total,
+        'institucional': institucional,
+        'personal': personal,
+        'porcentajeInstitucional': pct,
+        'quejas': quejas,
+        'sentimiento': sentimiento,
+        'severidad': severidad,
+        'temas': temas,
+        'carreras': carreras,
     })
 
 

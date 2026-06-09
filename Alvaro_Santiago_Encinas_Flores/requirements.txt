@@ -8,6 +8,8 @@ lxml==5.3.0
 
 # HTTP Requests
 requests==2.32.3
+# RSS/Atom parsing robusto (noticias bolivianas)
+feedparser==6.0.12
 aiohttp==3.10.11
 
 # Base de Datos
